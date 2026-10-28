@@ -6,7 +6,7 @@ export const newSecret = () => `whsec_${randomBytes(18).toString('hex')}`;
 const MAX_EVENTS = 500;
 
 // ---------------------------------------------------------------- memory ----
-// Used when no DATABASE_URL is set (local dev, tests) and as a fallback if the
+// Used when no MONGODB_URI is set (local dev, tests) and as a fallback if the
 // database is unreachable, so the demo never goes down with it.
 export function createMemoryStore() {
   const endpoints = new Map();
@@ -106,171 +106,134 @@ export function createMemoryStore() {
   };
 }
 
-// -------------------------------------------------------------- postgres ----
-const SCHEMA = `
-CREATE TABLE IF NOT EXISTS endpoints (
-  id          text PRIMARY KEY,
-  name        text NOT NULL,
-  target_url  text NOT NULL,
-  secret      text NOT NULL,
-  created_at  timestamptz NOT NULL DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS events (
-  id              text PRIMARY KEY,
-  endpoint_id     text NOT NULL REFERENCES endpoints(id) ON DELETE CASCADE,
-  received_at     timestamptz NOT NULL DEFAULT now(),
-  headers         jsonb NOT NULL DEFAULT '{}',
-  body            text NOT NULL,
-  status          text NOT NULL DEFAULT 'pending',
-  attempts        int NOT NULL DEFAULT 0,
-  next_attempt_at timestamptz NOT NULL DEFAULT now(),
-  claimed_at      timestamptz,
-  last_status     int,
-  last_error      text,
-  delivered_at    timestamptz
-);
-CREATE INDEX IF NOT EXISTS events_due_idx ON events (next_attempt_at) WHERE status = 'pending';
-CREATE INDEX IF NOT EXISTS events_received_idx ON events (received_at DESC);
-CREATE TABLE IF NOT EXISTS attempts (
-  id        bigserial PRIMARY KEY,
-  event_id  text NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-  at        timestamptz NOT NULL DEFAULT now(),
-  ok        boolean NOT NULL,
-  status    int,
-  ms        int,
-  snippet   text,
-  error     text
-);
-CREATE INDEX IF NOT EXISTS attempts_event_idx ON attempts (event_id);
-`;
-
-const iso = (v) => (v instanceof Date ? v.toISOString() : v);
-const mapEndpoint = (r) => ({ id: r.id, name: r.name, targetUrl: r.target_url, secret: r.secret, createdAt: iso(r.created_at) });
-const mapEvent = (r) => ({
-  id: r.id, endpointId: r.endpoint_id, receivedAt: iso(r.received_at), headers: r.headers, body: r.body,
-  status: r.status, attempts: r.attempts, nextAttemptAt: iso(r.next_attempt_at),
-  lastStatus: r.last_status, lastError: r.last_error, deliveredAt: iso(r.delivered_at),
+// ---------------------------------------------------------------- mongodb ----
+const toIso = (v) => (v instanceof Date ? v.toISOString() : v ?? null);
+const mapEndpoint = (d) => ({ id: d._id, name: d.name, targetUrl: d.targetUrl, secret: d.secret, createdAt: toIso(d.createdAt) });
+const mapEvent = (d) => ({
+  id: d._id, endpointId: d.endpointId, receivedAt: toIso(d.receivedAt), headers: d.headers, body: d.body,
+  status: d.status, attempts: d.attempts, nextAttemptAt: toIso(d.nextAttemptAt),
+  lastStatus: d.lastStatus ?? null, lastError: d.lastError ?? null, deliveredAt: toIso(d.deliveredAt),
 });
 
-export async function createPostgresStore(connectionString) {
-  const { default: pg } = await import('pg');
-  const ssl = /localhost|127\.0\.0\.1/.test(connectionString) ? false : { rejectUnauthorized: false };
-  const pool = new pg.Pool({ connectionString, ssl, max: 5, connectionTimeoutMillis: 8000 });
-  const q = (text, params) => pool.query(text, params);
+export async function createMongoStore(uri, dbName) {
+  const { MongoClient } = await import('mongodb');
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 8000, maxPoolSize: 5 });
+  await client.connect();
+  const db = dbName ? client.db(dbName) : client.db();
+  const endpoints = db.collection('endpoints');
+  const events = db.collection('events');
+  const attempts = db.collection('attempts');
 
   return {
-    kind: 'postgres',
+    kind: 'mongodb',
     async init() {
-      await q(SCHEMA);
+      await events.createIndex({ status: 1, nextAttemptAt: 1 });
+      await events.createIndex({ receivedAt: -1 });
+      await events.createIndex({ endpointId: 1 });
+      await attempts.createIndex({ eventId: 1, at: 1 });
     },
 
     async createEndpoint({ name, targetUrl, secret }) {
-      const { rows } = await q(
-        'INSERT INTO endpoints (id, name, target_url, secret) VALUES ($1,$2,$3,$4) RETURNING *',
-        [newId('ep'), name, targetUrl, secret || newSecret()],
-      );
-      return mapEndpoint(rows[0]);
+      const doc = { _id: newId('ep'), name, targetUrl, secret: secret || newSecret(), createdAt: new Date() };
+      await endpoints.insertOne(doc);
+      return mapEndpoint(doc);
     },
     async listEndpoints() {
-      const { rows } = await q('SELECT * FROM endpoints ORDER BY created_at');
-      return rows.map(mapEndpoint);
+      return (await endpoints.find().sort({ createdAt: 1 }).toArray()).map(mapEndpoint);
     },
     async getEndpoint(id) {
-      const { rows } = await q('SELECT * FROM endpoints WHERE id = $1', [id]);
-      return rows[0] ? mapEndpoint(rows[0]) : null;
+      const d = await endpoints.findOne({ _id: id });
+      return d ? mapEndpoint(d) : null;
     },
     async deleteEndpoint(id) {
-      const { rowCount } = await q('DELETE FROM endpoints WHERE id = $1', [id]);
-      return rowCount > 0;
+      const { deletedCount } = await endpoints.deleteOne({ _id: id });
+      const ids = (await events.find({ endpointId: id }, { projection: { _id: 1 } }).toArray()).map((e) => e._id);
+      if (ids.length) {
+        await events.deleteMany({ _id: { $in: ids } });
+        await attempts.deleteMany({ eventId: { $in: ids } });
+      }
+      return deletedCount > 0;
     },
 
     async insertEvent({ endpointId, headers, body }) {
-      const { rows } = await q(
-        'INSERT INTO events (id, endpoint_id, headers, body) VALUES ($1,$2,$3,$4) RETURNING *',
-        [newId('evt'), endpointId, JSON.stringify(headers), body],
-      );
-      // Keep the table small on a free instance.
-      await q(
-        'DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY received_at DESC OFFSET $1)',
-        [MAX_EVENTS],
-      );
-      return mapEvent(rows[0]);
+      const now = new Date();
+      const doc = {
+        _id: newId('evt'), endpointId, receivedAt: now, headers, body,
+        status: 'pending', attempts: 0, nextAttemptAt: now, claimedAt: null,
+        lastStatus: null, lastError: null, deliveredAt: null,
+      };
+      await events.insertOne(doc);
+      // Keep the collection small on a free cluster.
+      const old = await events.find({}, { projection: { _id: 1 } }).sort({ receivedAt: -1 }).skip(MAX_EVENTS).toArray();
+      if (old.length) {
+        const ids = old.map((e) => e._id);
+        await events.deleteMany({ _id: { $in: ids } });
+        await attempts.deleteMany({ eventId: { $in: ids } });
+      }
+      return mapEvent(doc);
     },
-    // SKIP LOCKED lets several workers pull from the same queue without
-    // delivering an event twice.
-    async claimDue(limit) {
-      const { rows } = await q(
-        `UPDATE events SET status = 'delivering', claimed_at = now()
-         WHERE id IN (
-           SELECT id FROM events
-           WHERE status = 'pending' AND next_attempt_at <= now()
-           ORDER BY next_attempt_at
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         ) RETURNING *`,
-        [limit],
-      );
-      return rows.map(mapEvent);
+    // findOneAndUpdate is atomic per document, so several workers can pull from
+    // the same queue without delivering an event twice.
+    async claimDue(limit, now = Date.now()) {
+      const out = [];
+      for (let i = 0; i < limit; i++) {
+        const d = await events.findOneAndUpdate(
+          { status: 'pending', nextAttemptAt: { $lte: new Date(now) } },
+          { $set: { status: 'delivering', claimedAt: new Date(now) } },
+          { sort: { nextAttemptAt: 1 }, returnDocument: 'after' },
+        );
+        if (!d) break;
+        out.push(mapEvent(d));
+      }
+      return out;
     },
     async requeueStale(olderThanMs) {
-      const { rowCount } = await q(
-        `UPDATE events SET status = 'pending'
-         WHERE status = 'delivering' AND claimed_at < now() - ($1 || ' milliseconds')::interval`,
-        [String(olderThanMs)],
+      const { modifiedCount } = await events.updateMany(
+        { status: 'delivering', claimedAt: { $lt: new Date(Date.now() - olderThanMs) } },
+        { $set: { status: 'pending' } },
       );
-      return rowCount;
+      return modifiedCount;
     },
     async recordAttempt(eventId, { ok, status, ms, snippet, error }, update) {
-      const client = await pool.connect();
-      try {
-        await client.query('BEGIN');
-        await client.query(
-          'INSERT INTO attempts (event_id, ok, status, ms, snippet, error) VALUES ($1,$2,$3,$4,$5,$6)',
-          [eventId, ok, status ?? null, ms ?? null, snippet ?? null, error ?? null],
-        );
-        await client.query(
-          `UPDATE events SET attempts = attempts + 1, status = $2, next_attempt_at = $3,
-             last_status = $4, last_error = $5,
-             delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END
-           WHERE id = $1`,
-          [eventId, update.status, update.nextAttemptAt, status ?? null, error ?? null],
-        );
-        await client.query('COMMIT');
-      } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
-      } finally {
-        client.release();
-      }
+      await attempts.insertOne({ eventId, at: new Date(), ok, status: status ?? null, ms: ms ?? null, snippet: snippet ?? null, error: error ?? null });
+      const set = { status: update.status, nextAttemptAt: new Date(update.nextAttemptAt), lastStatus: status ?? null, lastError: error || null };
+      if (update.status === 'delivered') set.deliveredAt = new Date();
+      await events.updateOne({ _id: eventId }, { $inc: { attempts: 1 }, $set: set });
     },
     async requeue(id) {
-      const { rows } = await q(
-        `UPDATE events SET status = 'pending', attempts = 0, next_attempt_at = now()
-         WHERE id = $1 AND status <> 'delivering' RETURNING *`,
-        [id],
+      const d = await events.findOneAndUpdate(
+        { _id: id, status: { $ne: 'delivering' } },
+        { $set: { status: 'pending', attempts: 0, nextAttemptAt: new Date() } },
+        { returnDocument: 'after' },
       );
-      return rows[0] ? mapEvent(rows[0]) : null;
+      return d ? mapEvent(d) : null;
     },
     async getEvent(id) {
-      const { rows } = await q('SELECT * FROM events WHERE id = $1', [id]);
-      if (!rows[0]) return null;
-      const log = await q('SELECT at, ok, status, ms, snippet, error FROM attempts WHERE event_id = $1 ORDER BY id', [id]);
-      return { ...mapEvent(rows[0]), attemptLog: log.rows.map((a) => ({ ...a, at: iso(a.at) })) };
+      const d = await events.findOne({ _id: id });
+      if (!d) return null;
+      const log = await attempts.find({ eventId: id }).sort({ at: 1 }).toArray();
+      return {
+        ...mapEvent(d),
+        attemptLog: log.map(({ at, ok, status, ms, snippet, error }) => ({ at: toIso(at), ok, status, ms, snippet, error })),
+      };
     },
     async listEvents({ endpointId, status, limit = 50 } = {}) {
-      const { rows } = await q(
-        `SELECT *, length(body) AS size FROM events
-         WHERE ($1::text IS NULL OR endpoint_id = $1) AND ($2::text IS NULL OR status = $2)
-         ORDER BY received_at DESC LIMIT $3`,
-        [endpointId || null, status || null, limit],
-      );
-      return rows.map(({ body, ...r }) => ({ ...mapEvent({ ...r, body: '' }), body: undefined, size: r.size }));
+      const match = {};
+      if (endpointId) match.endpointId = endpointId;
+      if (status) match.status = status;
+      const rows = await events.aggregate([
+        { $match: match },
+        { $sort: { receivedAt: -1 } },
+        { $limit: limit },
+        { $addFields: { size: { $strLenBytes: '$body' } } },
+        { $project: { body: 0 } },
+      ]).toArray();
+      return rows.map((r) => ({ ...mapEvent({ ...r, body: undefined }), body: undefined, size: r.size }));
     },
     async stats() {
-      const { rows } = await q('SELECT status, count(*)::int AS n FROM events GROUP BY status');
       const out = { total: 0, pending: 0, delivering: 0, delivered: 0, dead: 0 };
-      for (const r of rows) {
-        out[r.status] = r.n;
+      for (const r of await events.aggregate([{ $group: { _id: '$status', n: { $sum: 1 } } }]).toArray()) {
+        out[r._id] = r.n;
         out.total += r.n;
       }
       return out;

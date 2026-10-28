@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
-import { createMemoryStore, createPostgresStore } from './store.js';
+import { createMemoryStore, createMongoStore } from './store.js';
 import { createDemoTarget, startWorker } from './relay.js';
 import { checkTarget, createLimiter, verify } from './security.js';
 
@@ -167,14 +167,14 @@ export function createApp({ store, demo, adminToken = '', ingestLimit = 120, adm
   });
 }
 
-export async function createStore(databaseUrl = process.env.DATABASE_URL) {
-  if (databaseUrl) {
+export async function createStore(mongoUri = process.env.MONGODB_URI) {
+  if (mongoUri) {
     try {
-      const store = await createPostgresStore(databaseUrl);
+      const store = await createMongoStore(mongoUri);
       await store.init();
       return store;
     } catch (err) {
-      console.error('Postgres unavailable, falling back to in-memory storage:', err.message);
+      console.error('MongoDB unavailable, falling back to in-memory storage:', err.message);
     }
   }
   const store = createMemoryStore();
