@@ -2,6 +2,8 @@
 
 Receives webhooks, queues them, and delivers them to your destination with automatic retries and backoff. A live dashboard shows every event and every delivery attempt, and any event can be replayed.
 
+**Live demo:** https://hook-relay.onrender.com (free instance, the first load can take about 50 seconds to wake up). Set the demo destination to *failing*, send a test event, and watch the retries; set it back to *healthy* and replay.
+
 **Stack:** Node.js 20+ (plain `node:http`, no framework) and MongoDB. The only dependency is the official `mongodb` driver.
 
 ## What it does
