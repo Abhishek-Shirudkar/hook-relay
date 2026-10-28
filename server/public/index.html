@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HookRelay</title>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --text:#16202e; --muted:#5d6b7e; --border:#dde2ea; --accent:#0f766e; --accent-text:#fff;
+          --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --code:#eef1f6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0b1220; --panel:#111a2c; --text:#e8edf6; --muted:#93a1b6; --border:#22304a; --accent:#2dd4bf; --accent-text:#06231f;
+            --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --code:#1a2640; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; }
+  .wrap { max-width:1000px; margin:0 auto; padding:16px; }
+  h1 { margin:8px 0 2px; font-size:1.5rem; } h2 { font-size:1.05rem; margin:0 0 10px; }
+  .sub { color:var(--muted); margin:0 0 16px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:14px 16px; margin-bottom:14px; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; }
+  .stat { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 14px; }
+  .stat b { display:block; font-size:1.5rem; } .stat span { color:var(--muted); font-size:.85rem; }
+  button { font:inherit; border:0; border-radius:8px; padding:7px 14px; background:var(--accent); color:var(--accent-text); font-weight:600; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--text); border:1px solid var(--border); font-weight:500; }
+  button.danger { background:transparent; color:var(--bad); border:1px solid var(--border); font-weight:500; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  input, select { font:inherit; padding:8px 10px; border-radius:8px; border:1px solid var(--border); background:var(--panel); color:var(--text); }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .grow { flex:1; min-width:160px; }
+  code, pre { background:var(--code); border-radius:6px; font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  code { padding:1px 5px; } pre { padding:10px; overflow:auto; margin:6px 0; white-space:pre-wrap; word-break:break-all; }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  th { text-align:left; color:var(--muted); font-weight:500; padding:6px 8px; border-bottom:1px solid var(--border); }
+  td { padding:8px; border-bottom:1px solid var(--border); vertical-align:top; }
+  tr.click { cursor:pointer; } tr.click:hover td { background:var(--code); }
+  .pill { display:inline-block; padding:1px 9px; border-radius:999px; font-size:.78rem; font-weight:600; border:1px solid currentColor; }
+  .delivered { color:var(--ok); } .pending, .delivering { color:var(--warn); } .dead { color:var(--bad); }
+  .muted { color:var(--muted); } .small { font-size:.85rem; }
+  .ep { display:flex; flex-wrap:wrap; gap:8px; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--border); }
+  .ep:last-child { border-bottom:0; }
+  .err { color:var(--bad); min-height:1.3em; }
+  dialog { border:1px solid var(--border); border-radius:12px; background:var(--panel); color:var(--text); max-width:640px; width:calc(100% - 24px); padding:16px; }
+  dialog::backdrop { background:rgba(0,0,0,.5); }
+  .scroll { overflow-x:auto; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>HookRelay</h1>
+  <p class="sub">Receive webhooks, queue them, deliver them with automatic retries, and see every attempt. <span id="mode" class="muted"></span></p>
+
+  <div class="stats" id="stats"></div>
+
+  <div class="card">
+    <h2>Try the retries</h2>
+    <p class="small muted" style="margin-top:0">The demo endpoint delivers to a built-in destination. Set it to <b>failing</b>, send a few test events, and watch them retry with growing delays. Then set it back to <b>healthy</b> and they get delivered on their next retry.</p>
+    <div class="row">
+      <span>Demo destination: <b id="demoState">…</b></span>
+      <button class="ghost" id="toggleDemo">Toggle</button>
+      <span style="flex:1"></span>
+      <button id="sendTest">Send test event</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Endpoints</h2>
+    <div id="endpoints"></div>
+    <form id="newEp" class="row" style="margin-top:10px">
+      <input class="grow" id="epName" placeholder="Name, e.g. Orders service" maxlength="60" required>
+      <input class="grow" id="epUrl" placeholder="Destination URL (https://…) or type: demo" required>
+      <button type="submit">Add endpoint</button>
+    </form>
+    <div class="err small" id="epErr"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between; margin-bottom:8px">
+      <h2 style="margin:0">Events</h2>
+      <select id="filter">
+        <option value="">All statuses</option><option>pending</option><option>delivered</option><option>dead</option>
+      </select>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Received</th><th>Endpoint</th><th>Status</th><th>Attempts</th><th>Last result</th></tr></thead>
+      <tbody id="events"></tbody>
+    </table></div>
+    <p class="muted small" id="empty" hidden>No events yet. Send a test event above.</p>
+  </div>
+</div>
+
+<dialog id="detail"></dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+let token = sessionStorage.getItem('hr_token') || '';
+let endpoints = [];
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    ...opts,
+    headers: { 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) },
+  });
+  if (res.status === 401) {
+    token = prompt('This instance needs an admin token:') || '';
+    sessionStorage.setItem('hr_token', token);
+    if (token) return api(path, opts);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'Request failed (' + res.status + ')');
+  return data;
+}
+
+const ago = (iso) => {
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  return s < 60 ? s + 's ago' : s < 3600 ? Math.round(s / 60) + 'm ago' : Math.round(s / 3600) + 'h ago';
+};
+const until = (iso) => Math.max(0, Math.round((Date.parse(iso) - Date.now()) / 1000));
+const pill = (s) => `<span class="pill ${s}">${s}</span>`;
+
+async function refresh() {
+  try {
+    const [stats, eps, events, demo, health] = await Promise.all([
+      api('/api/stats'), api('/api/endpoints'), api('/api/events?limit=50' + ($('filter').value ? '&status=' + $('filter').value : '')),
+      api('/api/demo'), fetch('/api/health').then((r) => r.json()),
+    ]);
+    endpoints = eps;
+    $('mode').textContent = '· storage: ' + health.db;
+    $('stats').innerHTML = ['total', 'pending', 'delivered', 'dead']
+      .map((k) => `<div class="stat"><b class="${k}">${stats[k] + (k === 'pending' ? stats.delivering : 0)}</b><span>${k}</span></div>`).join('');
+    $('demoState').innerHTML = demo.healthy ? '<span class="delivered">healthy</span>' : '<span class="dead">failing</span>';
+    $('endpoints').innerHTML = eps.map((e) => `
+      <div class="ep">
+        <div><b>${esc(e.name)}</b> <span class="muted small">→ ${esc(e.targetUrl)}</span>
+          <div class="small muted">Send to <code>POST ${location.origin}/hook/${esc(e.id)}</code></div></div>
+        <button class="danger" data-del="${esc(e.id)}">Delete</button>
+      </div>`).join('') || '<p class="muted small">No endpoints yet.</p>';
+    const name = (id) => (eps.find((e) => e.id === id) || {}).name || id;
+    $('events').innerHTML = events.map((e) => `
+      <tr class="click" data-ev="${esc(e.id)}">
+        <td>${ago(e.receivedAt)}</td><td>${esc(name(e.endpointId))}</td>
+        <td>${pill(e.status)}${e.status === 'pending' && e.attempts ? `<div class="muted small">retry in ${until(e.nextAttemptAt)}s</div>` : ''}</td>
+        <td>${e.attempts}</td>
+        <td class="small">${e.lastError ? esc(e.lastError) : e.lastStatus ? 'HTTP ' + e.lastStatus : '<span class="muted">waiting</span>'}</td>
+      </tr>`).join('');
+    $('empty').hidden = events.length > 0;
+  } catch (err) {
+    $('epErr').textContent = err.message;
+  }
+}
+
+$('toggleDemo').onclick = async () => {
+  const cur = await api('/api/demo');
+  await api('/api/demo/health', { method: 'POST', body: JSON.stringify({ healthy: !cur.healthy }) });
+  refresh();
+};
+
+$('sendTest').onclick = async () => {
+  const ep = endpoints.find((e) => e.targetUrl === 'demo') || endpoints[0];
+  if (!ep) return ($('epErr').textContent = 'Add an endpoint first.');
+  const body = JSON.stringify({ type: 'order.created', orderId: Math.floor(Math.random() * 9000 + 1000), at: new Date().toISOString() });
+  const res = await fetch('/hook/' + ep.id, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+  if (!res.ok) $('epErr').textContent = (await res.json()).error;
+  refresh();
+};
+
+$('newEp').onsubmit = async (e) => {
+  e.preventDefault();
+  $('epErr').textContent = '';
+  try {
+    const ep = await api('/api/endpoints', { method: 'POST', body: JSON.stringify({ name: $('epName').value, targetUrl: $('epUrl').value }) });
+    $('epName').value = $('epUrl').value = '';
+    alert('Endpoint created.\nSigning secret (shown once): ' + ep.secret + '\nDeliveries carry an X-HookRelay-Signature header (HMAC-SHA256 of the body).');
+  } catch (err) {
+    $('epErr').textContent = err.message;
+  }
+  refresh();
+};
+
+$('endpoints').onclick = async (e) => {
+  const id = e.target.dataset.del;
+  if (id && confirm('Delete this endpoint and its events?')) { await api('/api/endpoints/' + id, { method: 'DELETE' }); refresh(); }
+};
+
+$('events').onclick = async (e) => {
+  const row = e.target.closest('[data-ev]');
+  if (!row) return;
+  const ev = await api('/api/events/' + row.dataset.ev);
+  let body = ev.body;
+  try { body = JSON.stringify(JSON.parse(ev.body), null, 2); } catch {}
+  $('detail').innerHTML = `
+    <div class="row" style="justify-content:space-between"><h2 style="margin:0">${esc(ev.id)} ${pill(ev.status)}</h2>
+      <button class="ghost" id="closeDetail">Close</button></div>
+    <p class="muted small">Received ${new Date(ev.receivedAt).toLocaleString()} · ${ev.attempts} attempt(s)</p>
+    <b class="small">Payload</b><pre>${esc(body)}</pre>
+    <b class="small">Delivery attempts</b>
+    <table><thead><tr><th>When</th><th>Result</th><th>Time</th></tr></thead><tbody>
+      ${ev.attemptLog.map((a) => `<tr><td>${new Date(a.at).toLocaleTimeString()}</td>
+        <td class="${a.ok ? 'delivered' : 'dead'}">${a.ok ? 'OK' : 'Failed'} ${a.status ? 'HTTP ' + a.status : ''} ${esc(a.error || '')}
+          <div class="muted small">${esc(a.snippet || '')}</div></td><td>${a.ms ?? ''} ms</td></tr>`).join('') ||
+        '<tr><td colspan="3" class="muted">Not attempted yet.</td></tr>'}
+    </tbody></table>
+    <div class="row" style="margin-top:12px"><button id="replay" ${ev.status === 'delivering' ? 'disabled' : ''}>Replay</button></div>`;
+  $('detail').showModal();
+  $('closeDetail').onclick = () => $('detail').close();
+  $('replay').onclick = async () => { await api('/api/events/' + ev.id + '/replay', { method: 'POST' }); $('detail').close(); refresh(); };
+};
+
+$('filter').onchange = refresh;
+refresh();
+setInterval(() => { if (!$('detail').open) refresh(); }, 3000);
+</script>
+</body>
+</html>
