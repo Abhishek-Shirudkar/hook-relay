@@ -2,12 +2,12 @@
 
 Receives webhooks, queues them, and delivers them to your destination with automatic retries and backoff. A live dashboard shows every event and every delivery attempt, and any event can be replayed.
 
-**Stack:** Node.js 20+ (plain `node:http`, no framework) and PostgreSQL. The only dependency is the `pg` driver.
+**Stack:** Node.js 20+ (plain `node:http`, no framework) and MongoDB. The only dependency is the official `mongodb` driver.
 
 ## What it does
 
 1. **Ingest:** `POST /hook/<endpoint-id>` accepts a payload (up to 100 KB), stores it, and answers `202` straight away. If you send an `X-Signature: sha256=<hmac>` header it is verified, and bad signatures get `401`.
-2. **Queue:** events wait in Postgres. Workers claim due events with `FOR UPDATE SKIP LOCKED`, so several workers can run without delivering the same event twice. Events stuck mid-delivery (a crashed worker) go back to the queue after 60 s.
+2. **Queue:** events wait in MongoDB. Workers claim due events with an atomic `findOneAndUpdate`, so several workers can run without delivering the same event twice. Events stuck mid-delivery (a crashed worker) go back to the queue after 60 s.
 3. **Deliver:** each attempt is a signed `POST` (`X-HookRelay-Signature: sha256=<hmac of the body>`) with an 8 s timeout. Any 2xx counts as delivered.
 4. **Retry:** failures retry after 5 s, 15 s, 45 s, 2 min and 5 min. After 5 failed attempts the event is marked **dead** and stays visible for inspection.
 5. **Inspect and replay:** the dashboard lists events, shows each attempt (status code, time, response snippet) and has a Replay button.
@@ -17,7 +17,7 @@ Receives webhooks, queues them, and delivers them to your destination with autom
 - **SSRF protection:** destinations must be public `http(s)` URLs. The host is resolved and rejected if any address is private, loopback, link-local or otherwise internal. This is checked when an endpoint is created and again before every delivery, and redirects are never followed.
 - **Limits:** 100 KB payloads, 20 endpoints, 500 stored events, per-IP rate limits on ingest and admin writes.
 - **Optional admin token:** set `ADMIN_TOKEN` and every `/api/*` call needs `Authorization: Bearer <token>`. The public ingest URLs stay open. Without it (the public demo) anyone can use the dashboard, so don't send real data.
-- If Postgres is unreachable at start-up the server falls back to in-memory storage instead of going down.
+- If MongoDB is unreachable at start-up the server falls back to in-memory storage instead of going down.
 
 ## Try the retries (in the dashboard)
 
@@ -29,8 +29,8 @@ The demo endpoint delivers to a built-in destination. Set it to **failing**, cli
 cd server
 npm install
 npm start            # http://localhost:4300, in-memory storage
-# with Postgres:
-DATABASE_URL=postgres://user:pass@localhost:5432/hookrelay npm start
+# with MongoDB:
+MONGODB_URI=mongodb://localhost:27017/hookrelay npm start
 npm test             # 13 tests, no database needed
 ```
 
@@ -53,13 +53,13 @@ const ok = timingSafeEqual(Buffer.from(expected), Buffer.from(req.headers['x-hoo
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | none | Postgres connection string. Without it, data lives in memory |
+| `MONGODB_URI` | none | MongoDB connection string (Atlas free tier works). Without it, data lives in memory |
 | `ADMIN_TOKEN` | none | Protects the dashboard API |
 | `PORT` | `4300` | Port to listen on |
 
 ## Deploying (Render)
 
-Create a Web Service from this repo with root directory `server`, build command `npm install`, start command `npm start`. Optionally add a Render PostgreSQL database and set `DATABASE_URL` to its internal URL.
+Create a Web Service from this repo with root directory `server`, build command `npm install`, start command `npm start`. Optionally create a free MongoDB Atlas cluster and set `MONGODB_URI` to its connection string.
 
 ## Known limits and next steps
 
